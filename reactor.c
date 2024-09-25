@@ -1,187 +1,229 @@
 #include <sys/socket.h>
 #include <errno.h>
 #include <netinet/in.h>
+
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+
 #include <pthread.h>
-#include <sys/select.h>
 #include <sys/poll.h>
 #include <sys/epoll.h>
+#include <sys/time.h>
 
-#define BUFFER_LENGTH 1024
+
+#define BUFFER_LENGTH		512
 
 typedef int (*RCALLBACK)(int fd);
 
-// 对于listenfd  → accept_cb()
-int acceprt_cb(int fd);
-
-// 对于clientfd → recv_cb()
-
-//                send_cb()
-
+// listenfd
+// EPOLLIN --> 
+int accept_cb(int fd); 
+// clientfd
+// 
 int recv_cb(int fd);
-
 int send_cb(int fd);
 
-
-struct conn_item{
-    int fd;
-    char rbuffer[BUFFER_LENGTH];
+// conn, fd, buffer, callback
+struct conn_item {
+	int fd;
+	
+	char rbuffer[BUFFER_LENGTH];
 	int rlen;
 	char wbuffer[BUFFER_LENGTH];
 	int wlen;
 
-    union {
+	union {
 		RCALLBACK accept_callback;
 		RCALLBACK recv_callback;
 	} recv_t;
 	RCALLBACK send_callback;
-};  
+};
+// libevent --> 
+
 
 int epfd = 0;
+struct conn_item connlist[1048576] = {0}; // 1024  2G     2 * 512 * 1024 * 1024 
+// list
+struct timeval zvoice_king;
+// 
+// 1000000
 
-struct conn_item conn_list[1024] = {0}; //连接列表
-
-#if 0
-struct reactor{
-    int epollfd; //epoll实例
-    struct conn_item *conn_list; //连接列表
-};
+#define TIME_SUB_MS(tv1, tv2)  ((tv1.tv_sec - tv2.tv_sec) * 1000 + (tv1.tv_usec - tv2.tv_usec) / 1000)
 
 
-#endif
+int set_event(int fd, int event, int flag) {
 
-int set_event(int fd, int event,int flag){
-    if(flag){   // 1 add,0 modify
-        struct epoll_event ev; //epoll事件
-        ev.events = event; //监听读事件
-        ev.data.fd = fd; //监听clientfd
-        epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev); //将clientfd加入epoll实例
-    }else{
-        struct epoll_event ev; 
-        ev.events = event; 
-        ev.data.fd = fd; 
-        epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev); 
+	if (flag) { // 1 add, 0 mod
+		struct epoll_event ev;
+		ev.events = event ;
+		ev.data.fd = fd;
+		epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+	} else {
+	
+		struct epoll_event ev;
+		ev.events = event;
+		ev.data.fd = fd;
+		epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+	}
 
-    }
+	
+
 }
 
-int accept_cb(int fd){
-    struct sockaddr_in clientaddr;  //客户端地址
-    socklen_t len = sizeof(clientaddr); //客户端地址长度
+int accept_cb(int fd) {
 
-    int clientfd = accept(fd, (struct sockaddr *)&clientaddr, &len); //接受连接
-    if(clientfd < 0){
-        perror("accept");
-        return -1;
-    }
-    
-    set_event(clientfd, EPOLLIN, 1); //将clientfd加入epoll实例，监听读事件
+	struct sockaddr_in clientaddr;
+	socklen_t len = sizeof(clientaddr);
+	
+	int clientfd = accept(fd, (struct sockaddr*)&clientaddr, &len);
+	if (clientfd < 0) {
+		return -1;
+	}
+	set_event(clientfd, EPOLLIN, 1);
 
-    conn_list[clientfd].fd = clientfd; //将clientfd加入连接列表
-    memset(conn_list[clientfd].rbuffer, 0, BUFFER_LENGTH); //清空缓冲区
-    conn_list[clientfd].rlen = 0; //缓冲区索引从0开始
-    memset(conn_list[clientfd].wbuffer, 0, BUFFER_LENGTH);
-	conn_list[clientfd].wlen = 0;
+	connlist[clientfd].fd = clientfd;
+	memset(connlist[clientfd].rbuffer, 0, BUFFER_LENGTH);
+	connlist[clientfd].rlen = 0;
+	memset(connlist[clientfd].wbuffer, 0, BUFFER_LENGTH);
+	connlist[clientfd].wlen = 0;
+	
+	connlist[clientfd].recv_t.recv_callback = recv_cb;
+	connlist[clientfd].send_callback = send_cb;
 
-    conn_list[clientfd].recv_t.recv_callback = recv_cb;
-    conn_list[clientfd].send_callback = send_cb;
+	if ((clientfd % 1000) == 999) {
+		struct timeval tv_cur;
+		gettimeofday(&tv_cur, NULL);
+		int time_used = TIME_SUB_MS(tv_cur, zvoice_king);
 
-    printf("new client fd %d\n", clientfd);
-    return clientfd;
+		memcpy(&zvoice_king, &tv_cur, sizeof(struct timeval));
+		
+		printf("clientfd : %d, time_used: %d\n", clientfd, time_used);
+	}
+
+	return clientfd;
 }
 
 
 // recv
 // buffer -> conn_list[fd].buffer
-int recv_cb(int fd){
-    char* buffer = conn_list[fd].rbuffer; //获取缓冲区
-    int idx = conn_list[fd].rlen; //获取缓冲区索引
+int recv_cb(int fd) { // fd --> EPOLLIN
 
-    int count = recv(fd, buffer+idx, BUFFER_LENGTH-idx,0); //读取数据
+	char *buffer = connlist[fd].rbuffer; 
+	int idx = connlist[fd].rlen;
+	
+	int count = recv(fd, buffer+idx, BUFFER_LENGTH-idx, 0);
+	if (count == 0) {
+		printf("disconnect\n");
 
-    if(count == 0){ //如果读取到0，表示客户端关闭连接
-        printf("client close\n");
+		epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);		
+		close(fd);
+		
+		return -1;
+	}
+	connlist[fd].rlen += count;
 
-        epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL); //将clientfd从epoll实例中删除
-        close(fd); //关闭clientfd
+#if 1 //echo: need to send
+	memcpy(connlist[fd].wbuffer, connlist[fd].rbuffer, connlist[fd].rlen);
+	connlist[fd].wlen = connlist[fd].rlen;
+	connlist[fd].rlen -= connlist[fd].rlen;
+#else
 
-        return -1;
-    }
-    conn_list[fd].rlen += count; //更新缓冲区索引   
-    
-#if 1   //need to send
-    memcpy(conn_list[fd].wbuffer, conn_list[fd].rbuffer, conn_list[fd].rlen);
-    conn_list[fd].wlen = conn_list[fd].rlen;
-    conn_list[fd].rlen -= conn_list[fd].wlen;
+	//http_request(&connlist[fd]);
+	//http_response(&connlist[fd]);
+
 #endif
 
-    // 修改事件
-    set_event(fd,EPOLLOUT,0);
-    return count;
+	set_event(fd, EPOLLOUT, 0);
+
+	
+	return count;
 }
 
-int send_cb(int fd){
-    char* buffer = conn_list[fd].wbuffer; //获取缓冲区
-    int idx = conn_list[fd].wlen; //获取缓冲区索引
-    int count = send(fd, buffer, idx, 0);
+int send_cb(int fd) {
 
-    // 修改事件
-    set_event(fd,EPOLLIN,0);
+	char *buffer = connlist[fd].wbuffer;
+	int idx = connlist[fd].wlen;
 
-    return count;
+	int count = send(fd, buffer, idx, 0);
+
+	set_event(fd, EPOLLIN, 0);
+
+	return count;
+}
+
+
+int init_server(unsigned short port) {
+
+	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+
+	struct sockaddr_in serveraddr;
+	memset(&serveraddr, 0, sizeof(struct sockaddr_in));
+
+	serveraddr.sin_family = AF_INET;
+	serveraddr.sin_addr.s_addr = htonl(INADDR_ANY);
+	serveraddr.sin_port = htons(port);
+
+	if (-1 == bind(sockfd, (struct sockaddr*)&serveraddr, sizeof(struct sockaddr))) {
+		perror("bind");
+		return -1;
+	}
+
+	listen(sockfd, 10);
+
+	return sockfd;
 }
 
 // tcp 
 int main() {
 
-	int sockfd = socket(AF_INET, SOCK_STREAM, 0);   //创建套接字
-    
-	struct sockaddr_in serveraddr; 
-	memset(&serveraddr, 0, sizeof(struct sockaddr_in)); 
+	int port_count = 20;
+	unsigned short port = 2048;
+	int i = 0;
 
-	serveraddr.sin_family = AF_INET; 
-	serveraddr.sin_addr.s_addr = htonl(INADDR_ANY); 
-	serveraddr.sin_port = htons(2048);
+	
+	epfd = epoll_create(1); // int size
 
-	if (-1 == bind(sockfd, (struct sockaddr*)&serveraddr, sizeof(struct sockaddr))) { //绑定
-		perror("bind");
-		return -1;
+	for (i = 0;i < port_count;i ++) {
+		int sockfd = init_server(port + i);  // 2048, 2049, 2050, 2051 ... 2057
+		connlist[sockfd].fd = sockfd;
+		connlist[sockfd].recv_t.accept_callback = accept_cb;
+		set_event(sockfd, EPOLLIN, 1);
 	}
 
-	listen(sockfd, 10); //监听
+	gettimeofday(&zvoice_king, NULL);
 
-//epoll
-    int epfd = epoll_create(1); //创建epoll实例
+	struct epoll_event events[1024] = {0};
+	
+	while (1) { // mainloop();
 
-    set_event(sockfd, EPOLLIN, 1);
+		int nready = epoll_wait(epfd, events, 1024, -1); // 
 
-    struct epoll_event events[1024] = {0}; //epoll事件数组
-
-    while(1){   // mainloop
-        int nready = epoll_wait(epfd,events,1024,-1); //等待事件发生
-
-        int i = 0;
-        for (i = 0;i < nready;i ++) {
+		int i = 0;
+		for (i = 0;i < nready;i ++) {
 
 			int connfd = events[i].data.fd;
 			if (events[i].events & EPOLLIN) { //
 
-				int count = conn_list[connfd].recv_t.recv_callback(connfd);
-				printf("recv count: %d <-- buffer: %s\n", count, conn_list[connfd].rbuffer);
+				int count = connlist[connfd].recv_t.recv_callback(connfd);
+				//printf("recv count: %d <-- buffer: %s\n", count, connlist[connfd].rbuffer);
 
 			} else if (events[i].events & EPOLLOUT) { 
-				printf("send --> buffer: %s\n",  conn_list[connfd].wbuffer);
+				// printf("send --> buffer: %s\n",  connlist[connfd].wbuffer);
 				
-				int count = conn_list[connfd].send_callback(connfd);
+				int count = connlist[connfd].send_callback(connfd);
 			}
 
 		}
 
-    }
+	}
 
-    getchar();
-   // close(clientfd);
-	
+
+	getchar();
+	//close(clientfd);
+
 }
+
+
+
+
